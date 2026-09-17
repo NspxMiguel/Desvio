@@ -783,6 +783,17 @@ function createWindow() {
     console.error('[renderer] gone:', details.reason)
   );
   if (process.env.DESVIO_DEVTOOLS) mainWindow.webContents.openDevTools({ mode: 'detach' });
+  // DESVIO_SHOT=<file> renders one frame and quits. Capturing from inside the app
+  // needs no screen-recording permission, which is what makes site and store
+  // screenshots reproducible instead of hand-taken.
+  if (process.env.DESVIO_SHOT) {
+    mainWindow.webContents.once('did-finish-load', async () => {
+      await new Promise((resolve) => setTimeout(resolve, 1500));
+      const image = await mainWindow.webContents.capturePage();
+      fs.writeFileSync(process.env.DESVIO_SHOT, image.toPNG());
+      app.quit();
+    });
+  }
   mainWindow.loadFile(path.join(__dirname, 'renderer', 'index.html'));
 }
 
