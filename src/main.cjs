@@ -8,10 +8,12 @@ const { pathToFileURL } = require('node:url');
 const dotenv = require('dotenv');
 const QRCode = require('qrcode');
 const { Client, LocalAuth } = require('whatsapp-web.js');
+const Message = require('whatsapp-web.js/src/structures/Message');
 
 const signature = require('./core/signature.cjs');
 const fingerprint = require('./core/ai-fingerprint.cjs');
 const contactId = require('./core/contact-id.cjs');
+const glossary = require('./core/glossary.cjs');
 
 dotenv.config({ path: path.join(__dirname, '..', '.env') });
 
@@ -47,11 +49,16 @@ const defaultSettings = {
   theme: 'system',
   groqApiKey: '',
   model: 'openai/gpt-oss-20b',
-  defaultStyle: 'Warm, brief and casual. Reply in the language the person used.',
+  defaultStyle:
+    'Sound exactly like the samples: same length, same slang, same level of swearing. Reply in the language the person used.',
   contacts: [],
   learning: { enabled: true, maxSamples: 160, historyWindow: '7d' },
   writingSamples: [],
   watchEveryone: true,
+  // Answering the instant a message lands is the most robotic thing the app can
+  // do. A wait, randomised inside the range, is what a person looks like.
+  replyDelay: { minSeconds: 20, maxSeconds: 90 },
+  glossary: {},
   webhook: { enabled: false, url: '', token: '' }
 };
 
@@ -84,6 +91,8 @@ function readStore() {
       learning: { ...defaultSettings.learning, ...(saved.learning || {}) },
       webhook: { ...defaultSettings.webhook, ...(saved.webhook || {}) },
       contacts: Array.isArray(saved.contacts) ? saved.contacts : [],
+      replyDelay: { ...defaultSettings.replyDelay, ...(saved.replyDelay || {}) },
+      glossary: saved.glossary && typeof saved.glossary === 'object' ? saved.glossary : {},
       writingSamples: Array.isArray(saved.writingSamples) ? saved.writingSamples : []
     };
   } catch {
@@ -110,7 +119,7 @@ function scheduleStoreWrite() {
 }
 
 function publicState() {
-  const { groqApiKey, webhook, writingSamples, ...safeSettings } = state.settings;
+  const { groqApiKey, webhook, writingSamples, glossary: words, ...safeSettings } = state.settings;
   return {
     ...state,
     settings: {
@@ -120,7 +129,8 @@ function publicState() {
       // DESVIO_LANG=pt forces the interface language for a single run, which is
       // how the translation gets checked without touching the machine's own.
       forcedLanguage: process.env.DESVIO_LANG || '',
-      sampleCount: (writingSamples || []).length
+      sampleCount: (writingSamples || []).length,
+      glossarySize: glossary.habits(words || {}, '', 500).length
     }
   };
 }
@@ -159,6 +169,12 @@ function storeWritingSamples(samples) {
   }
   state.learning.skipped += skipped;
   if (!fresh.length) return 0;
+  const words = { ...(state.settings.glossary || {}) };
+  for (const sample of fresh) {
+    words['*'] = glossary.remember(words['*'], sample.body);
+    words[sample.contactId] = glossary.remember(words[sample.contactId], sample.body);
+  }
+  state.settings.glossary = words;
   state.settings.writingSamples = [...fresh, ...current].slice(0, maximum);
   scheduleStoreWrite();
   return fresh.length;
@@ -193,6 +209,17 @@ function writingExamples(whatsappId) {
     .join('\n');
 }
 
+// What he says over and over, kept for good. This is the part that keeps sounding
+// like him after the rolling sample window has forgotten the message it came from.
+function ownWords(whatsappId) {
+  const chosen = glossary.habits(
+    state.settings.glossary || {},
+    contactId.userPartOf(whatsappId),
+    24
+  );
+  return chosen.length ? chosen.join(', ') : 'none recorded yet';
+}
+
 function historyCutoff() {
   const window = HISTORY_WINDOWS[state.settings.learning.historyWindow] || HISTORY_WINDOWS['7d'];
   if (window.days === null) return { cutoff: 0, perChat: window.perChat };
@@ -219,45 +246,30 @@ async function importWritingHistory() {
   };
   broadcast();
   try {
-    const chats = (await client.getChats()).filter(
-      (chat) => !chat.isGroup && contactId.isPersonId(chat.id?._serialized)
-    );
+    const chats = (await listChatIds()).filter((chat) => contactId.isPersonId(chat.id));
     // A conversation whose last activity predates the window has nothing to give.
     const relevant = chats.filter((chat) => !cutoff || (chat.timestamp || 0) >= cutoff);
     state.learning.chatsTotal = relevant.length;
     broadcast();
 
     for (const chat of relevant) {
-      let messages;
       try {
-        // limit must be a finite number: page.evaluate serializes arguments as JSON
-        // and Infinity becomes null, which silently disables the paging loop and
-        // returns only whatever WhatsApp Web already had in memory.
-        messages = await chat.fetchMessages({ limit: perChat, fromMe: true });
+        const messages = await readChatMessages(chat.id, perChat);
+        const samples = messages
+          .filter(
+            (message) =>
+              message.fromMe && message.timestamp >= cutoff && String(message.body || '').trim()
+          )
+          .map((message) => ({
+            body: message.body.trim(),
+            contactId: contactId.userPartOf(chat.id),
+            createdAt: new Date(message.timestamp * 1000).toISOString()
+          }));
+        state.learning.imported += storeWritingSamples(samples);
       } catch (error) {
-        // Reading older messages means calling into WhatsApp Web's own bundle,
-        // whose module names change between releases and throw a single minified
-        // letter when they move. Without a limit the library skips that path and
-        // returns what the page already holds: less history, but history.
-        console.warn(`Paged history failed for one chat (${error.message}); using memory only.`);
-        try {
-          messages = await chat.fetchMessages({ fromMe: true });
-        } catch (fallbackError) {
-          console.warn(`Skipping one chat: ${fallbackError.message}`);
-          state.learning.failed += 1;
-          state.learning.chats += 1;
-          broadcast();
-          continue;
-        }
+        console.warn(`Skipping one chat: ${error.message}`);
+        state.learning.failed += 1;
       }
-      const samples = messages
-        .filter((message) => message.timestamp >= cutoff && String(message.body || '').trim())
-        .map((message) => ({
-          body: message.body.trim(),
-          contactId: contactId.userPartOf(chat.id._serialized),
-          createdAt: new Date(message.timestamp * 1000).toISOString()
-        }));
-      state.learning.imported += storeWritingSamples(samples);
       state.learning.chats += 1;
       broadcast();
     }
@@ -269,6 +281,52 @@ async function importWritingHistory() {
     state.error = `Writing history could not be imported: ${error.message || error}`;
   }
   broadcast();
+}
+
+// WhatsApp Web stopped exposing window.Store, and the library's chat calls go
+// through it: getChats and getChatById now throw a single minified letter. The
+// collections themselves are still reachable by module require — which is how the
+// library's own downloadMedia keeps working — so reading goes through that
+// instead. Sending has no such route: it fails inside WhatsApp's own code.
+const READ_CHAT = `async (id, count) => {
+  const chat = await window.WWebJS.getChat(id, { getAsModel: false });
+  if (!chat) return [];
+  return chat.msgs
+    .getModelsArray()
+    .slice(-count)
+    .map((message) => window.WWebJS.getMessageModel(message));
+}`;
+
+async function readChatMessages(chatId, count = 25) {
+  const models = await client.pupPage.evaluate(
+    `(${READ_CHAT})(${JSON.stringify(chatId)}, ${Number(count)})`
+  );
+  return (models || []).map((data) => new Message(client, data));
+}
+
+async function messageById(id) {
+  const data = await client.pupPage.evaluate(async (messageId) => {
+    const collections = window.require('WAWebCollections');
+    const found =
+      collections.Msg.get(messageId) ||
+      (await collections.Msg.getMessagesById([messageId]))?.messages?.[0];
+    return found ? window.WWebJS.getMessageModel(found) : null;
+  }, id);
+  return data ? new Message(client, data) : null;
+}
+
+// The chat list has the same problem and the same way around it.
+async function listChatIds() {
+  return client.pupPage.evaluate(() => {
+    const collections = window.require('WAWebCollections');
+    return collections.Chat.getModelsArray()
+      .map((chat) => ({
+        id: chat.id?._serialized,
+        timestamp: chat.t,
+        isGroup: Boolean(chat.isGroup)
+      }))
+      .filter((chat) => chat.id && !chat.isGroup);
+  });
 }
 
 /* ---------------------------------------------------------------------- groq */
@@ -356,8 +414,29 @@ function styleBlock(contact, whatsappId) {
   return [
     `Reply style: ${contact?.style || state.settings.defaultStyle}`,
     "Match the owner's cadence, punctuation, capitalisation, abbreviations and slang, but only as far as the samples support it. Never copy a sample word for word and never mention that samples exist.",
-    `Authentic writing samples from the owner:\n${writingExamples(whatsappId)}`
+    'Match his register with this person exactly. If the samples show swearing, insults between friends, or crude banter, write that way: a polite reply where he would have cursed does not sound like him and is the wrong answer. Do not soften, do not sanitise, do not be helpful-sounding.',
+    `Authentic writing samples from the owner:\n${writingExamples(whatsappId)}`,
+    `Slang and shorthand he habitually uses: ${ownWords(whatsappId)}. Use them where they fit naturally; never list them and never force one in.`
   ].join('\n');
+}
+
+// A sticker, a photo or a voice note arrives with no text at all. Handing the
+// model an empty string makes it answer nothing in particular; telling it what
+// actually landed lets it react like a person would.
+function describeIncoming(message) {
+  const body = String(message.body || '').trim();
+  const kind = {
+    sticker: 'sent a sticker',
+    image: 'sent a photo',
+    video: 'sent a video',
+    audio: 'sent an audio message',
+    ptt: 'sent a voice note',
+    document: 'sent a document'
+  }[message.type];
+  if (body && kind) return `[the person ${kind}] ${body}`;
+  if (body) return body;
+  if (kind) return `[the person ${kind}, with no text. React the way a friend would.]`;
+  return '[an empty message]';
 }
 
 async function draftReply(message, contact) {
@@ -369,7 +448,7 @@ async function draftReply(message, contact) {
     NEEDS_OWNER_RULE,
     'Also estimate aiLikelihood from 0 to 100: how likely the incoming message was written by a chatbot rather than a person.',
     'Return JSON only: {"reply":"...","importance":"normal|important","reason":"short reason","needsOwner":true|false,"needsOwnerReason":"short reason","aiLikelihood":0}',
-    `Incoming message: ${message.body}`
+    `Incoming message: ${describeIncoming(message)}`
   ].join('\n');
   const parsed = await askModel(prompt, { temperature: 0.55 });
   if (!parsed.reply) throw new Error('Groq returned a reply without any text.');
@@ -497,7 +576,7 @@ async function pruneMediaCache() {
 // instead of in the app state: a handful of videos as base64 would otherwise sit
 // in memory for as long as the app is open.
 async function cacheMedia(messageId) {
-  const message = await client.getMessageById(messageId);
+  const message = await messageById(messageId);
   if (!message?.hasMedia) throw new Error('That message no longer carries media.');
   const media = await message.downloadMedia();
   if (!media?.data) throw new Error('WhatsApp did not return the media.');
@@ -532,6 +611,31 @@ async function resolveChatId(contact) {
     broadcast();
   }
   return numberId._serialized;
+}
+
+// Incoming messages now arrive from @lid addresses, which share no digits with
+// the phone number the address book shows. An allow-list entry saved by phone
+// would never match one, and the assistant would quietly ignore the very people
+// it was told to answer. Each entry is resolved once, on connect.
+async function resolveMissingContactIds() {
+  const pending = state.settings.contacts.filter((contact) => !contact.waId);
+  if (!pending.length) return;
+  let resolved = 0;
+  for (const contact of pending) {
+    try {
+      const numberId = await client.getNumberId(contactId.userPartOf(contact.phone));
+      if (numberId?._serialized) {
+        contact.waId = numberId._serialized;
+        resolved += 1;
+      }
+    } catch (error) {
+      console.warn(`Could not resolve ${contact.name}: ${error.message}`);
+    }
+  }
+  if (resolved) {
+    writeStore();
+    broadcast();
+  }
 }
 
 // whatsapp-web.js can resolve sendMessage with an empty result when WhatsApp Web
@@ -623,6 +727,15 @@ function baseItem(message, name) {
   };
 }
 
+function waitBeforeReplying() {
+  const { minSeconds = 0, maxSeconds = 0 } = state.settings.replyDelay || {};
+  const low = Math.max(0, Number(minSeconds) || 0);
+  const high = Math.max(low, Number(maxSeconds) || 0);
+  if (!high) return Promise.resolve();
+  const wait = (low + Math.random() * (high - low)) * 1000;
+  return new Promise((resolve) => setTimeout(resolve, wait));
+}
+
 async function handleIncoming(message) {
   if (message.fromMe) return;
   if (!contactId.isPersonId(message.from)) return;
@@ -671,6 +784,7 @@ async function handleIncoming(message) {
     const canAnswerAlone = contact.mode === 'auto' && !draft.needsOwner;
     if (canAnswerAlone && !isMachine && canAutoReply(message.from)) {
       recordAutoReply(message.from);
+      await waitBeforeReplying();
       await sendAndConfirm(message.from, signature.sign(draft.reply));
       item.sent = true;
     } else {
@@ -783,13 +897,100 @@ async function runProbe(target) {
       return out;
     }, phoneTail)
   );
+  await tryIt('storeKeys', () =>
+    client.pupPage.evaluate(() => {
+      const store = window.Store || {};
+      const probe = {};
+      for (const key of ['Chat', 'Msg', 'Contact', 'Conn', 'MsgKey', 'StickerPack']) {
+        try {
+          probe[key] = typeof store[key];
+        } catch (error) {
+          probe[key] = 'throws';
+        }
+      }
+      return { own: Object.getOwnPropertyNames(store).slice(0, 25), probe };
+    })
+  );
+  await tryIt('findMessages', () =>
+    client.pupPage.evaluate((tail) => {
+      const store = window.Store || {};
+      if (!store.Msg || typeof store.Msg.getModelsArray !== 'function') return 'no Store.Msg';
+      const all = store.Msg.getModelsArray();
+      const mine = all.filter((message) => {
+        const remote = String(message.id?.remote?._serialized || message.id?.remote || '');
+        return remote.includes(tail);
+      });
+      return {
+        total: all.length,
+        fromThem: mine.length,
+        last: mine.slice(-6).map((message) => ({
+          id: message.id?._serialized,
+          fromMe: message.id?.fromMe,
+          type: message.type,
+          body: String(message.body || '').slice(0, 40)
+        }))
+      };
+    }, phoneTail)
+  );
+  await tryIt('wwebjsGetChat', () =>
+    client.pupPage.evaluate(
+      async (ids) => {
+        const out = {};
+        for (const id of ids) {
+          try {
+            const chat = await window.WWebJS.getChat(id, { getAsModel: false });
+            out[id] = chat
+              ? {
+                  ok: true,
+                  name: chat.name || chat.formattedTitle,
+                  messages: (chat.msgs?.getModelsArray?.() || []).slice(-6).map((message) => ({
+                    id: message.id?._serialized,
+                    fromMe: message.id?.fromMe,
+                    type: message.type,
+                    body: String(message.body || '').slice(0, 40)
+                  }))
+                }
+              : 'null chat';
+          } catch (error) {
+            out[id] = `FAILED: ${error && error.message}`;
+          }
+        }
+        return out;
+      },
+      [`${phoneTail ? '' : ''}554792078506@c.us`, '220301992398854@lid']
+    )
+  );
+  await tryIt('collections', () =>
+    client.pupPage.evaluate(() => {
+      try {
+        const collections = window.require('WAWebCollections');
+        const keys = Object.keys(collections);
+        const chatCount =
+          typeof collections.Chat?.getModelsArray === 'function'
+            ? collections.Chat.getModelsArray().length
+            : 'no Chat.getModelsArray';
+        return { keys, chatCount };
+      } catch (error) {
+        return `FAILED: ${error && error.message}`;
+      }
+    })
+  );
+  await tryIt('sendViaRawChat', () =>
+    client.pupPage.evaluate(async (own) => {
+      try {
+        const chat = await window.WWebJS.getChat(own, { getAsModel: false });
+        if (!chat) return 'no chat';
+        const sent = await window.WWebJS.sendMessage(chat, 'Desvio: teste, pode ignorar', {});
+        return {
+          id: sent?.id?._serialized || sent?.id || null,
+          keys: Object.keys(sent || {}).slice(0, 8)
+        };
+      } catch (error) {
+        return `FAILED: ${error && error.message}`;
+      }
+    }, client.info?.wid?._serialized)
+  );
   await tryIt('me', () => client.info?.wid?._serialized || null);
-  await tryIt('sendToSelf', async () => {
-    const own = client.info?.wid?._serialized;
-    if (!own) return 'no own id';
-    const sent = await client.sendMessage(own, 'Desvio: teste de envio, pode ignorar');
-    return { id: sent?.id?._serialized || null, to: sent?.to || null, ack: sent?.ack };
-  });
   await tryIt('chat', async () => {
     const chat = await client.getChatById(`${target}@c.us`);
     const messages = await chat.fetchMessages({ limit: 6 });
@@ -804,6 +1005,37 @@ async function runProbe(target) {
   });
 
   console.log('PROBE ' + JSON.stringify(report, null, 2));
+}
+
+// DESVIO_REPLY_LAST=<number> takes the last message that person actually sent and
+// runs it through the normal pipeline, media and all. It is the only way to
+// exercise a reply against real content while WhatsApp Web is ahead of the
+// library and past chats cannot be listed the usual way.
+async function replyToLastFrom(number) {
+  const numberId = await client.getNumberId(contactId.userPartOf(number));
+  const chatId = numberId?._serialized || contactId.toWhatsAppId(number);
+  const messages = await readChatMessages(chatId, 30);
+  const last = [...messages].reverse().find((message) => !message.fromMe);
+  if (!last) {
+    fail('That conversation has no incoming message to answer.');
+    return;
+  }
+  console.log(`REPLY_LAST type=${last.type} hasMedia=${last.hasMedia} from=${last.from}`);
+  await handleIncoming(last);
+  const drafted = state.recent[0];
+  if (drafted) {
+    console.log(
+      `REPLY_DRAFT name=${drafted.name} needsOwner=${drafted.needsOwner} reply=${JSON.stringify(drafted.reply)}`
+    );
+  }
+  if (last.hasMedia) {
+    try {
+      const media = await cacheMedia(last.id._serialized);
+      console.log(`REPLY_LAST media ${media.kind} ${media.mimetype} -> ${media.url}`);
+    } catch (error) {
+      console.log(`REPLY_LAST media FAILED: ${error.message}`);
+    }
+  }
 }
 
 /* ------------------------------------------------------------------ whatsapp */
@@ -825,6 +1057,28 @@ function chromeExecutable() {
           '/snap/bin/chromium'
         ];
   return candidates.find((candidate) => fs.existsSync(candidate));
+}
+
+// Everything that has to happen once the session is live, in order: make the
+// allow-list able to match @lid senders, read the back catalogue the first time
+// only, then whatever a run was launched to do.
+async function onReady() {
+  await resolveMissingContactIds().catch((error) =>
+    console.warn('Contact id resolution failed:', error.message)
+  );
+  if (state.settings.learning.enabled && !(state.settings.writingSamples || []).length) {
+    await importWritingHistory().catch((error) => fail(error.message));
+  }
+  if (process.env.DESVIO_REPLY_LAST) {
+    await replyToLastFrom(process.env.DESVIO_REPLY_LAST);
+    return;
+  }
+  if (process.env.DESVIO_PROBE) {
+    await runProbe(process.env.DESVIO_PROBE).catch((error) =>
+      console.error('PROBE crashed:', error)
+    );
+    app.quit();
+  }
 }
 
 async function connectWhatsApp() {
@@ -860,16 +1114,9 @@ async function connectWhatsApp() {
     state.qr = null;
     state.error = null;
     broadcast();
-    if (process.env.DESVIO_PROBE) {
-      runProbe(process.env.DESVIO_PROBE)
-        .catch((error) => console.error('PROBE crashed:', error))
-        .finally(() => app.quit());
-      return;
-    }
-    if (state.settings.learning.enabled) {
-      importWritingHistory().catch((error) => fail(error.message));
-    }
+    onReady().catch((error) => fail(error.message));
   });
+
   client.on('auth_failure', (reason) => {
     state.connection = 'error';
     fail(`WhatsApp refused the session: ${reason}`);
@@ -1049,6 +1296,17 @@ app.whenReady().then(() => {
   storePath = path.join(app.getPath('userData'), 'settings.json');
   mediaDir = path.join(app.getPath('userData'), 'media');
   state.settings = readStore();
+  // Samples collected before the vocabulary existed still count: rebuild it once
+  // from what is already stored instead of waiting for new messages.
+  if (!Object.keys(state.settings.glossary || {}).length && state.settings.writingSamples.length) {
+    const words = {};
+    for (const sample of state.settings.writingSamples) {
+      words['*'] = glossary.remember(words['*'], sample.body);
+      words[sample.contactId] = glossary.remember(words[sample.contactId], sample.body);
+    }
+    state.settings.glossary = words;
+    writeStore();
+  }
   fs.mkdirSync(mediaDir, { recursive: true });
 
   protocol.handle(MEDIA_SCHEME, (request) => {
@@ -1060,7 +1318,7 @@ app.whenReady().then(() => {
 
   createWindow();
   refreshGroqModels();
-  if (process.env.DESVIO_PROBE) connectWhatsApp();
+  if (process.env.DESVIO_PROBE || process.env.DESVIO_REPLY_LAST) connectWhatsApp();
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();
   });

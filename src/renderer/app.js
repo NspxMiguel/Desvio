@@ -481,6 +481,19 @@ function peopleView() {
 
 // Groq's catalogue changes under the app, so the choice is a list of what the key
 // can actually reach today, not a name typed from memory.
+const DELAY_PRESETS = [
+  ['0-0', 'delayNone'],
+  ['10-45', 'delayQuick'],
+  ['60-180', 'delayNormal'],
+  ['300-900', 'delayRelaxed']
+];
+
+function currentDelay() {
+  const { minSeconds = 0, maxSeconds = 0 } = state.settings.replyDelay || {};
+  const exact = `${minSeconds}-${maxSeconds}`;
+  return DELAY_PRESETS.some(([value]) => value === exact) ? exact : '10-45';
+}
+
 function modelField(current) {
   const models = state.groqModels || [];
   if (!models.length) {
@@ -566,6 +579,9 @@ function settingsView() {
               t('forgetSamples')
             )}</button>
             <span class="count">${s.sampleCount} ${escapeHtml(t('samplesStored'))}</span>
+            <span class="count muted-count">${s.glossarySize} ${escapeHtml(
+              t('glossaryWords')
+            )}</span>
             ${
               learning.skipped
                 ? `<span class="count muted-count">${learning.skipped} ${escapeHtml(
@@ -575,6 +591,19 @@ function settingsView() {
             }
           </div>
           <p class="hint">${escapeHtml(t('learnHint'))}</p>
+        </section>
+
+        <section class="setting-group">
+          <p class="eyebrow">${escapeHtml(t('cooldown'))}</p>
+          <label>${escapeHtml(t('cooldown'))}
+            <select name="replyDelay">${DELAY_PRESETS.map(
+              ([value, key]) =>
+                `<option value="${value}" ${
+                  currentDelay() === value ? 'selected' : ''
+                }>${escapeHtml(t(key))}</option>`
+            ).join('')}</select>
+          </label>
+          <p class="hint">${escapeHtml(t('cooldownHint'))}</p>
         </section>
 
         <section class="setting-group">
@@ -853,6 +882,12 @@ function bind() {
       theme: String(data.get('theme') || 'system'),
       language: String(data.get('language') || 'system'),
       watchEveryone: data.get('watchEveryone') === 'on',
+      replyDelay: (() => {
+        const [minSeconds, maxSeconds] = String(data.get('replyDelay') || '10-45')
+          .split('-')
+          .map(Number);
+        return { minSeconds, maxSeconds };
+      })(),
       learning: {
         ...state.settings.learning,
         enabled: data.get('learningEnabled') === 'on',
