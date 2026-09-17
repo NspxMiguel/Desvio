@@ -111,6 +111,12 @@ function sidebar() {
   )}</p></aside>`;
 }
 
+function needsYouTag(item) {
+  if (!item.needsOwner) return '';
+  const why = item.needsOwnerReason ? ` title="${escapeHtml(item.needsOwnerReason)}"` : '';
+  return `<span class="tag needs-you"${why}>${escapeHtml(t('needsYou'))}</span>`;
+}
+
 function importanceTag(item) {
   if (item.importance !== 'important') return '';
   const title = item.reason ? ` title="${escapeHtml(item.reason)}"` : '';
@@ -227,7 +233,7 @@ function replyCard(item) {
   return `
     <article class="reply-card">
       <div class="reply-meta">
-        <div><b>${escapeHtml(item.name)}</b>${importanceTag(item)}${aiTag(item)}</div>
+        <div><b>${escapeHtml(item.name)}</b>${needsYouTag(item)}${importanceTag(item)}${aiTag(item)}</div>
         <time>${escapeHtml(timeOf(item.receivedAt))}</time>
       </div>
       ${item.body ? `<p class="incoming">${escapeHtml(item.body)}</p>` : ''}
@@ -253,7 +259,7 @@ function recentRow(item) {
         <b>${escapeHtml(item.name)}</b>
         <span>${escapeHtml(preview)}</span>
       </div>
-      <div class="recent-tags">${item.sent ? `<span class="tag">${escapeHtml(t('sentAuto'))}</span>` : ''}${aiTag(
+      <div class="recent-tags">${item.sent ? `<span class="tag">${escapeHtml(t('sentAuto'))}</span>` : ''}${needsYouTag(item)}${aiTag(
         item
       )}${importanceTag(item)}</div>
     </li>`;
@@ -343,7 +349,6 @@ function inboxView() {
     <section class="content">
       <div class="page-heading"><h1>${escapeHtml(t('inbox'))}</h1></div>
       ${hero()}
-      ${directCard()}
       <div class="section-title">
         <h2>${escapeHtml(t('pendingTitle'))}</h2>
         <span class="count">${state.pending.length}</span>
@@ -358,6 +363,7 @@ function inboxView() {
       </div>
       <div class="section-title recent-title"><h2>${escapeHtml(t('recentTitle'))}</h2></div>
       <ul class="recent-list">${recent || `<li class="muted">${escapeHtml(t('emptyRecent'))}</li>`}</ul>
+      ${directCard()}
     </section>`;
 }
 
@@ -391,11 +397,11 @@ function contactForm(contact) {
             t('modeDisabled')
           )}</option>
           <option value="approval" ${
-            !contact.mode || contact.mode === 'approval' ? 'selected' : ''
+            contact.mode === 'approval' ? 'selected' : ''
           }>${escapeHtml(t('modeAsk'))}</option>
-          <option value="auto" ${contact.mode === 'auto' ? 'selected' : ''}>${escapeHtml(
-            t('modeAuto')
-          )}</option>
+          <option value="auto" ${
+            !contact.mode || contact.mode === 'auto' ? 'selected' : ''
+          }>${escapeHtml(t('modeAuto'))}</option>
         </select>
       </label>
       <label>${escapeHtml(t('styleForPerson'))}
@@ -789,7 +795,7 @@ function bind() {
   document.querySelector('[data-new-contact]')?.addEventListener('click', () => {
     run('contacts', async () => {
       addressBook = await window.desvio.getContacts();
-      editingContact = { mode: 'approval' };
+      editingContact = { mode: 'auto' };
     });
   });
   document.querySelectorAll('[data-edit-contact]').forEach((button) => {

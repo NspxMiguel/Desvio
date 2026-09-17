@@ -69,7 +69,7 @@ let state = {
   pending: [],
   recent: [],
   groqModels: [],
-  learning: { status: 'idle', imported: 0, skipped: 0, chats: 0, chatsTotal: 0 },
+  learning: { status: 'idle', imported: 0, skipped: 0, failed: 0, chats: 0, chatsTotal: 0 },
   error: null
 };
 
@@ -209,7 +209,14 @@ async function importWritingHistory() {
   if (state.learning.status === 'importing') return;
 
   const { cutoff, perChat } = historyCutoff();
-  state.learning = { status: 'importing', imported: 0, skipped: 0, chats: 0, chatsTotal: 0 };
+  state.learning = {
+    status: 'importing',
+    imported: 0,
+    skipped: 0,
+    failed: 0,
+    chats: 0,
+    chatsTotal: 0
+  };
   broadcast();
   try {
     const chats = (await client.getChats()).filter(
@@ -221,10 +228,28 @@ async function importWritingHistory() {
     broadcast();
 
     for (const chat of relevant) {
-      // limit must be a finite number: page.evaluate serializes arguments as JSON
-      // and Infinity becomes null, which silently disables the paging loop and
-      // returns only whatever WhatsApp Web already had in memory.
-      const messages = await chat.fetchMessages({ limit: perChat, fromMe: true });
+      let messages;
+      try {
+        // limit must be a finite number: page.evaluate serializes arguments as JSON
+        // and Infinity becomes null, which silently disables the paging loop and
+        // returns only whatever WhatsApp Web already had in memory.
+        messages = await chat.fetchMessages({ limit: perChat, fromMe: true });
+      } catch (error) {
+        // Reading older messages means calling into WhatsApp Web's own bundle,
+        // whose module names change between releases and throw a single minified
+        // letter when they move. Without a limit the library skips that path and
+        // returns what the page already holds: less history, but history.
+        console.warn(`Paged history failed for one chat (${error.message}); using memory only.`);
+        try {
+          messages = await chat.fetchMessages({ fromMe: true });
+        } catch (fallbackError) {
+          console.warn(`Skipping one chat: ${fallbackError.message}`);
+          state.learning.failed += 1;
+          state.learning.chats += 1;
+          broadcast();
+          continue;
+        }
+      }
       const samples = messages
         .filter((message) => message.timestamp >= cutoff && String(message.body || '').trim())
         .map((message) => ({
@@ -239,8 +264,9 @@ async function importWritingHistory() {
     writeStore();
     state.learning.status = 'ready';
   } catch (error) {
+    console.error('History import failed:', error);
     state.learning.status = 'error';
-    state.error = `Writing history could not be imported: ${error.message}`;
+    state.error = `Writing history could not be imported: ${error.message || error}`;
   }
   broadcast();
 }
@@ -314,6 +340,15 @@ async function refreshGroqModels() {
   }
 }
 
+// The assistant answers on its own by default. It stops and hands the message
+// over only when replying would mean deciding something for the owner: a plan, a
+// permission, a commitment, or a fact only he knows. Inventing an answer to
+// "can you play tonight?" is worse than saying nothing.
+const NEEDS_OWNER_RULE = [
+  'Set needsOwner to true when a truthful reply needs the owner himself: asking whether he can go out or play, agreeing to a plan, a date or a time, a commitment, money, or a fact only he would know (which page the homework is on, where something of his is).',
+  'Set needsOwner to false for small talk, reactions, acknowledgements, thanks, jokes, and anything answerable from the conversation alone.'
+].join('\n');
+
 const IMPORTANCE_RULE =
   'Important means urgency, a deadline, an emergency, money, a direct question that only the owner can answer, or a time-sensitive plan. Everything else is normal.';
 
@@ -331,8 +366,9 @@ async function draftReply(message, contact) {
     'Write only the reply text. Never say you are an AI and never promise anything the owner did not offer.',
     styleBlock(contact, message.from),
     `Classify the incoming message. ${IMPORTANCE_RULE}`,
+    NEEDS_OWNER_RULE,
     'Also estimate aiLikelihood from 0 to 100: how likely the incoming message was written by a chatbot rather than a person.',
-    'Return JSON only: {"reply":"...","importance":"normal|important","reason":"short reason","aiLikelihood":0}',
+    'Return JSON only: {"reply":"...","importance":"normal|important","reason":"short reason","needsOwner":true|false,"needsOwnerReason":"short reason","aiLikelihood":0}',
     `Incoming message: ${message.body}`
   ].join('\n');
   const parsed = await askModel(prompt, { temperature: 0.55 });
@@ -341,6 +377,8 @@ async function draftReply(message, contact) {
     reply: String(parsed.reply),
     importance: parsed.importance === 'important' ? 'important' : 'normal',
     reason: String(parsed.reason || ''),
+    needsOwner: Boolean(parsed.needsOwner),
+    needsOwnerReason: String(parsed.needsOwnerReason || ''),
     aiLikelihood: Number(parsed.aiLikelihood) || 0
   };
 }
@@ -477,6 +515,39 @@ async function cacheMedia(messageId) {
   };
 }
 
+// WhatsApp migrated accounts to LID addressing: the phone book still reports
+// 554792078506@c.us while the account's real, sendable id is now something like
+// 220301992398854@lid. Sending to the phone-shaped id reaches nobody, so the id
+// is resolved once per contact and kept.
+async function resolveChatId(contact) {
+  if (contact.waId && contact.waId.includes('@')) return contact.waId;
+  const numberId = await client.getNumberId(contactId.userPartOf(contact.phone));
+  if (!numberId?._serialized) {
+    throw new Error(`${contact.name} does not look like a WhatsApp account.`);
+  }
+  const stored = state.settings.contacts.find((candidate) => candidate.id === contact.id);
+  if (stored) {
+    stored.waId = numberId._serialized;
+    writeStore();
+    broadcast();
+  }
+  return numberId._serialized;
+}
+
+// whatsapp-web.js can resolve sendMessage with an empty result when WhatsApp Web
+// moves under it: no error, no message, and the app would happily report a send
+// that never happened. Nothing is treated as sent unless WhatsApp gave it an id.
+async function sendAndConfirm(chatId, text) {
+  if (!client) throw new Error('WhatsApp is not connected.');
+  const sent = await client.sendMessage(chatId, text);
+  if (!sent?.id?._serialized) {
+    throw new Error(
+      'WhatsApp accepted nothing back: the message was not sent. This build of WhatsApp Web is ahead of the library.'
+    );
+  }
+  return sent;
+}
+
 /* ------------------------------------------------------------------ messages */
 
 function contactKey(whatsappId) {
@@ -587,15 +658,20 @@ async function handleIncoming(message) {
       reply: draft.reply,
       importance: draft.importance,
       reason: draft.reason,
+      needsOwner: draft.needsOwner,
+      needsOwnerReason: draft.needsOwnerReason,
       ai: fingerprint.blend(local, draft.aiLikelihood)
     };
     pushRecent(item);
     await notifyImportant(item);
 
     const isMachine = item.ai.level === 'certain';
-    if (contact.mode === 'auto' && !isMachine && canAutoReply(message.from)) {
+    // Answering on its own is the normal case. A question only the owner can
+    // answer goes to him instead, even when the contact is set to reply alone.
+    const canAnswerAlone = contact.mode === 'auto' && !draft.needsOwner;
+    if (canAnswerAlone && !isMachine && canAutoReply(message.from)) {
       recordAutoReply(message.from);
-      await client.sendMessage(message.from, signature.sign(draft.reply));
+      await sendAndConfirm(message.from, signature.sign(draft.reply));
       item.sent = true;
     } else {
       state.pending = [item, ...state.pending.filter((entry) => entry.id !== item.id)];
@@ -604,6 +680,130 @@ async function handleIncoming(message) {
   } catch (error) {
     fail(error.message);
   }
+}
+
+// DESVIO_DEMO="text" pushes one synthetic incoming message through the real
+// pipeline — allow-list lookup, Groq draft, AI reading, importance — without a
+// linked account. It is how the reply path gets exercised before anyone scans a
+// QR code, and how the screenshots show the actual product instead of an empty
+// inbox. Nothing here runs unless the variable is set.
+async function injectDemoMessage(text) {
+  const contact = state.settings.contacts.find(
+    (candidate) => candidate.enabled !== false && candidate.mode !== 'disabled'
+  );
+  if (!contact) {
+    fail('Add someone under People before running a demo message.');
+    return;
+  }
+  const from = contact.waId || contactId.toWhatsAppId(contact.phone);
+  await handleIncoming({
+    id: { _serialized: `demo_${Date.now()}` },
+    from,
+    fromMe: false,
+    body: text,
+    hasMedia: false,
+    type: 'chat',
+    notifyName: contact.name
+  });
+}
+
+// DESVIO_PROBE=<number> connects, interrogates the live WhatsApp Web page and
+// prints what still works, then quits. WhatsApp changes its internals faster than
+// the library tracks them, and when a call starts failing the useful question is
+// which ones — not the minified letter the page throws.
+async function runProbe(target) {
+  const report = {};
+  const phoneTail = String(target).slice(-8);
+  const tryIt = async (name, run) => {
+    try {
+      report[name] = await run();
+    } catch (error) {
+      report[name] = `FAILED: ${error.message}`;
+    }
+  };
+
+  await tryIt('helpers', () =>
+    client.pupPage.evaluate(() => Object.keys(window.WWebJS || {}).sort())
+  );
+  await tryIt('getChats', async () => (await client.getChats()).length);
+  await tryIt('getContacts', async () => (await client.getContacts()).length);
+  await tryIt('numberId', async () => {
+    const id = await client.getNumberId(target);
+    return id ? id._serialized : 'not a WhatsApp account';
+  });
+  await tryIt('contactShape', async () => {
+    const contacts = await client.getContacts();
+    const mine = contacts.filter((contact) => contact.isMyContact && !contact.isGroup);
+    const hit = mine.find((contact) => String(contact.number || '').includes(target.slice(-8)));
+    const sample = (contact) =>
+      contact && {
+        serialized: contact.id?._serialized,
+        server: contact.id?.server,
+        user: contact.id?.user,
+        number: contact.number,
+        name: contact.name,
+        lid: contact.lid?._serialized || contact.lid || null
+      };
+    return { total: mine.length, target: sample(hit), firstThree: mine.slice(0, 3).map(sample) };
+  });
+  await tryIt('sendPath', async () => {
+    const id = await client.getNumberId(target);
+    return id ? { serialized: id._serialized, server: id.server, user: id.user } : null;
+  });
+  await tryIt('rawStore', () =>
+    client.pupPage.evaluate((phone) => {
+      const store = window.Store || {};
+      const out = { keys: Object.keys(store).length, hasChat: Boolean(store.Chat) };
+      try {
+        const chats = store.Chat.getModelsArray();
+        out.chatCount = chats.length;
+        const match = chats.find((chat) => String(chat.id?._serialized || '').includes(phone));
+        if (match) {
+          out.foundBy = 'phone';
+          out.chatId = match.id._serialized;
+        } else {
+          out.foundBy = 'none';
+          out.sampleIds = chats.slice(0, 5).map((chat) => chat.id?._serialized);
+        }
+        const target = match || chats.find((chat) => !chat.isGroup);
+        if (target) {
+          out.probeChatId = target.id?._serialized;
+          out.lastMessages = target.msgs
+            .getModelsArray()
+            .slice(-4)
+            .map((message) => ({
+              fromMe: message.id?.fromMe,
+              body: String(message.body || '').slice(0, 60),
+              t: message.t
+            }));
+        }
+      } catch (error) {
+        out.error = String(error && error.message);
+      }
+      return out;
+    }, phoneTail)
+  );
+  await tryIt('me', () => client.info?.wid?._serialized || null);
+  await tryIt('sendToSelf', async () => {
+    const own = client.info?.wid?._serialized;
+    if (!own) return 'no own id';
+    const sent = await client.sendMessage(own, 'Desvio: teste de envio, pode ignorar');
+    return { id: sent?.id?._serialized || null, to: sent?.to || null, ack: sent?.ack };
+  });
+  await tryIt('chat', async () => {
+    const chat = await client.getChatById(`${target}@c.us`);
+    const messages = await chat.fetchMessages({ limit: 6 });
+    return {
+      name: chat.name,
+      lastMessages: messages.map((message) => ({
+        fromMe: message.fromMe,
+        at: new Date(message.timestamp * 1000).toISOString(),
+        body: String(message.body || '').slice(0, 70)
+      }))
+    };
+  });
+
+  console.log('PROBE ' + JSON.stringify(report, null, 2));
 }
 
 /* ------------------------------------------------------------------ whatsapp */
@@ -660,6 +860,12 @@ async function connectWhatsApp() {
     state.qr = null;
     state.error = null;
     broadcast();
+    if (process.env.DESVIO_PROBE) {
+      runProbe(process.env.DESVIO_PROBE)
+        .catch((error) => console.error('PROBE crashed:', error))
+        .finally(() => app.quit());
+      return;
+    }
     if (state.settings.learning.enabled) {
       importWritingHistory().catch((error) => fail(error.message));
     }
@@ -786,9 +992,22 @@ function createWindow() {
   // DESVIO_SHOT=<file> renders one frame and quits. Capturing from inside the app
   // needs no screen-recording permission, which is what makes site and store
   // screenshots reproducible instead of hand-taken.
+  if (process.env.DESVIO_DEMO) {
+    mainWindow.webContents.once('did-finish-load', () => {
+      injectDemoMessage(process.env.DESVIO_DEMO).catch((error) => fail(error.message));
+    });
+  }
   if (process.env.DESVIO_SHOT) {
     mainWindow.webContents.once('did-finish-load', async () => {
-      await new Promise((resolve) => setTimeout(resolve, 1500));
+      await new Promise((resolve) =>
+        setTimeout(resolve, Number(process.env.DESVIO_SHOT_DELAY) || 1500)
+      );
+      if (process.env.DESVIO_SHOT_SCROLL) {
+        await mainWindow.webContents.executeJavaScript(
+          `window.scrollTo(0, ${Number(process.env.DESVIO_SHOT_SCROLL) || 0})`
+        );
+        await new Promise((resolve) => setTimeout(resolve, 400));
+      }
       const image = await mainWindow.webContents.capturePage();
       fs.writeFileSync(process.env.DESVIO_SHOT, image.toPNG());
       app.quit();
@@ -841,6 +1060,7 @@ app.whenReady().then(() => {
 
   createWindow();
   refreshGroqModels();
+  if (process.env.DESVIO_PROBE) connectWhatsApp();
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();
   });
@@ -929,7 +1149,7 @@ handle('reply:decide', async ({ id, action, reply }) => {
   if (!item) return publicState();
   if (action === 'send') {
     requireReady();
-    await client.sendMessage(item.contactId, signature.sign(reply));
+    await sendAndConfirm(item.contactId, signature.sign(reply));
   }
   state.pending = state.pending.filter((entry) => entry.id !== id);
   broadcast();
@@ -950,10 +1170,7 @@ handle('direct:draft', ({ id, instruction }) => draftForOwner(enabledContact(id)
 handle('direct:send', async ({ id, reply }) => {
   const contact = enabledContact(id);
   requireReady();
-  await client.sendMessage(
-    contact.waId || contactId.toWhatsAppId(contact.phone),
-    signature.sign(reply)
-  );
+  await sendAndConfirm(await resolveChatId(contact), signature.sign(reply));
   return true;
 });
 
