@@ -40,7 +40,7 @@ describe('matching a person across the forms WhatsApp uses', () => {
   });
 
   test('a stored contact matches by its WhatsApp id or by its number', () => {
-    const contact = { waId: '551187654321@c.us', phone: '5511987654321', name: 'Ana' };
+    const contact = { waId: '551187654321@c.us', phone: '5511987654321', name: 'Arthur' };
     expect(contactId.matchesContact(contact, '551187654321@c.us')).toBe(true);
     expect(contactId.matchesContact(contact, '5511987654321@c.us')).toBe(true);
     expect(contactId.matchesContact(contact, '5511999999999@c.us')).toBe(false);
@@ -49,7 +49,7 @@ describe('matching a person across the forms WhatsApp uses', () => {
 
   test('the allow-list finds the right person', () => {
     const contacts = [
-      { id: 'a', phone: '5511911111111', name: 'Ana' },
+      { id: 'a', phone: '5511911111111', name: 'Arthur' },
       { id: 'b', phone: '5511922222222', name: 'Bruno' }
     ];
     expect(contactId.findContact(contacts, '551122222222@c.us')?.id).toBe('b');
