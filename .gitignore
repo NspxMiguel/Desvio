@@ -1,0 +1,15 @@
+node_modules/
+dist/
+out/
+release/
+.env
+.wwebjs_auth/
+.wwebjs_cache/
+.DS_Store
+
+# Notas de trabalho: registro entre nós, não documentação do repositório.
+PEDIDOS.md
+CONTRATO.md
+IDEIAS.md
+DESIGN.md
+TRABALHO.md

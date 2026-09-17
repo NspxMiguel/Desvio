@@ -1,0 +1,35 @@
+{
+  "name": "desvio",
+  "productName": "Desvio",
+  "version": "0.1.0",
+  "description": "A local WhatsApp assistant that answers for you, in your own voice.",
+  "license": "MIT",
+  "author": "nspxmiguel (https://nspx.dev)",
+  "homepage": "https://www.nspx.dev/Desvio/",
+  "main": "src/main.cjs",
+  "type": "commonjs",
+  "scripts": {
+    "start": "electron .",
+    "dev": "electron .",
+    "test": "bun test",
+    "format": "prettier --write .",
+    "check": "prettier --check . && bun test"
+  },
+  "dependencies": {
+    "dotenv": "^16.6.1",
+    "qrcode": "^1.5.4",
+    "whatsapp-web.js": "^1.33.0"
+  },
+  "devDependencies": {
+    "electron": "^37.2.6",
+    "prettier": "^3.6.2"
+  },
+  "trustedDependencies": [
+    "electron",
+    "puppeteer"
+  ],
+  "allowScripts": {
+    "electron@37.10.3": true,
+    "puppeteer@24.38.0": true
+  }
+}
